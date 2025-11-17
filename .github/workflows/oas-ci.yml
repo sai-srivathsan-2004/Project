@@ -171,7 +171,7 @@ jobs:
           fi
 
       - name: Commit CSV back to repo (optional)
-        if: success() && -f salt_oas_result.csv
+        if: success() && [ -f salt_oas_result.csv ]
         uses: stefanzweifel/git-auto-commit-action@v4
         with:
           commit_message: "OAS analysis results: ${{ github.sha }}"
@@ -181,7 +181,7 @@ jobs:
           author_email: ci-bot@example.com
 
       - name: Send CSV via Outlook (optional)
-        if: success() && -f salt_oas_result.csv
+        if: success() && [ -f salt_oas_result.csv ]
         env:
           AZ_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZ_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
