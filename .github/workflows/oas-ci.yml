@@ -1,280 +1,227 @@
-name: OAS CI -> Salt Analysis
+name: OAS CI + Salt Analysis Pipeline
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: write
   id-token: write
 
 env:
-  OAS_CANDIDATES: "openapi.yaml openapi.yml openapi.json swagger.yaml swagger.yml swagger.json api/openapi.yaml api/openapi.json"
+  BACKEND_DIR: Fast-Store-API/backend
+  SALT_BASE: ${{ secrets.SALT_API_URL }}
+  SALT_TOKEN: ${{ secrets.SALT_API_TOKEN }}
 
 jobs:
-  oas-test:
+  salt-oas:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      # ---------------------------
-      # 1. CHECKOUT CODE
-      # ---------------------------
-      - name: Checkout
+      # ------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------
+      - name: Checkout Repo
         uses: actions/checkout@v4
 
-
-      # ---------------------------
-      # 2. SETUP RUNTIMES
-      # ---------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-
-      # ---------------------------
-      # 3. DETECT EXISTING OAS FILES
-      # ---------------------------
-      - name: Detect OAS file
-        id: detect_oas
-        run: |
-          echo "Searching for OAS files..."
-          FOUND=""
-          for f in $OAS_CANDIDATES; do
-            FILE=$(find . -type f -iname "$f" | head -n1 || true)
-            if [ -n "$FILE" ]; then
-              FOUND="$FILE"
-              break
-            fi
-          done
-
-          if [ -n "$FOUND" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "path=$FOUND" >> $GITHUB_OUTPUT
-            echo "Found OAS: $FOUND"
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "path=" >> $GITHUB_OUTPUT
-            echo "No OAS found."
-          fi
-
-
-      # ---------------------------
-      # 4. INSTALL BACKEND DEPS
-      # ---------------------------
-      - name: Install backend dependencies
-        if: always()
-        working-directory: backend
+      # ------------------------------------------
+      # 2. Install dependencies (backend)
+      # ------------------------------------------
+      - name: Install Backend Dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
         run: |
           if [ -f package.json ]; then
             npm ci || npm install
-          else
-            echo "No backend/package.json found—skipping"
           fi
 
+      # ------------------------------------------
+      # 3. AUTO-DETECT EXPRESS ROUTES + GENERATE OAS
+      # ------------------------------------------
+      - name: Install swagger-autogen
+        run: npm install -g swagger-autogen glob
 
-      # ---------------------------
-      # 5. GENERATE OAS IF MISSING
-      # ---------------------------
-      - name: Generate OAS using swagger-autogen
-        if: steps.detect_oas.outputs.found == 'false'
+      - name: Generate OAS Auto
+        id: gen_oas
+        working-directory: ${{ env.BACKEND_DIR }}
         run: |
-          npm install -g swagger-autogen
           mkdir -p scripts
 
-          cat > scripts/generate_oas.js <<'EOF'
+          cat > scripts/autogen.js <<'EOF'
+          const glob = require('glob');
           const swaggerAutogen = require('swagger-autogen')();
-          const outputFile = './openapi.generated.json';
-          const endpointsFiles = [
-            './backend/index.js',
-            './backend/app.js',
-            './backend/server.js',
-            './backend/routes.js',
-            './backend/routes/index.js'
-          ];
-          const doc = {
-            info: { title: 'Fast-Store-API (Generated)', description: 'Auto-generated OAS' },
-            host: 'localhost:3000',
-            schemes: ['http']
-          };
-          swaggerAutogen(outputFile, endpointsFiles, doc);
+
+          const files = glob.sync("**/*.js", {
+            ignore: ["node_modules/**", "scripts/**", "**/*.test.js"]
+          });
+
+          // Express heuristics
+          const core = [];
+          const pref = ["index.js", "app.js", "routes/index.js"];
+          for (const p of pref) {
+            const f = files.find(x => x.endsWith(p));
+            if (f) core.push("./" + f);
+          }
+
+          // Add additional express/router files
+          for (const f of files) {
+            if (core.length >= 20) break;
+            if (/route|router|express/.test(f) && !core.includes("./" + f)) {
+              core.push("./" + f);
+            }
+          }
+
+          if (core.length === 0) {
+            const idx = files.find(f => f.endsWith("index.js"));
+            if (idx) core.push("./" + idx);
+          }
+
+          console.log("Detected files:", core);
+
+          const outputFile = "./openapi.generated.json";
+          const doc = { info: { title: "Fast Store API", description: "Autogenerated OAS" } };
+
+          swaggerAutogen(outputFile, core, doc).then(() => {
+            console.log("Swagger OAS generated");
+          });
           EOF
 
-          node scripts/generate_oas.js || true
+          node scripts/autogen.js
 
           if [ -f openapi.generated.json ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "path=openapi.generated.json" >> $GITHUB_OUTPUT
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-          fi
-
-
-      # ---------------------------
-      # 6. CONSOLIDATE OAS PATH
-      # ---------------------------
-      - name: Determine final OAS file
-        id: final_oas
-        run: |
-          if [ "${{ steps.detect_oas.outputs.found }}" == "true" ]; then
-            echo "oas_path=${{ steps.detect_oas.outputs.path }}" >> $GITHUB_OUTPUT
-          elif [ -f openapi.generated.json ]; then
-            echo "oas_path=openapi.generated.json" >> $GITHUB_OUTPUT
+            echo "oas_path=${{ env.BACKEND_DIR }}/openapi.generated.json" >> $GITHUB_OUTPUT
           else
             echo "oas_path=" >> $GITHUB_OUTPUT
           fi
 
-          echo "Final OAS path: ${{ steps.final_oas.outputs.oas_path }}"
-
-
-      # ---------------------------
-      # 7. LINT OAS (Spectral)
-      # ---------------------------
-      - name: Lint OAS with Spectral
-        if: steps.final_oas.outputs.oas_path != ''
-        run: |
-          npm install -g @stoplight/spectral-cli
-          spectral lint "${{ steps.final_oas.outputs.oas_path }}" || true
-
-
-      # ---------------------------
-      # 8. UPLOAD TO SALT
-      # ---------------------------
+      # ------------------------------------------
+      # 4. Upload OAS → POST /v1/oas/files
+      # ------------------------------------------
       - name: Upload OAS to Salt
-        id: salt_upload
-        if: steps.final_oas.outputs.oas_path != ''
-        env:
-          SALT_API_URL: ${{ secrets.SALT_API_URL }}
-          SALT_API_TOKEN: ${{ secrets.SALT_API_TOKEN }}
+        id: oas_upload
+        if: steps.gen_oas.outputs.oas_path != ''
         run: |
-          set -e
-          FILE="${{ steps.final_oas.outputs.oas_path }}"
+          FILE="${{ steps.gen_oas.outputs.oas_path }}"
 
-          echo "Uploading $FILE to Salt..."
+          RESP=$(curl -s -w "\n%{http_code}" -X POST "$SALT_BASE/v1/oas/files" \
+            -H "Authorization: Bearer $SALT_TOKEN" \
+            -H "accept: application/json" \
+            -F "name=faststore-oas-${GITHUB_SHA::7}" \
+            -F "file[]=@${FILE}")
 
-          # IMPORTANT: Replace this endpoint with your SALT tenant's correct one.
-          RESPONSE=$(curl -s -X POST "$SALT_API_URL/api/v1/oas/upload" \
-            -H "Authorization: Bearer $SALT_API_TOKEN" \
-            -F "file=@${FILE}")
+          STATUS=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "$BODY" > oas_upload.json
 
-          echo "$RESPONSE" > salt_upload_resp.json
-          echo "Salt upload response saved."
+          OASID=$(jq -r '.oasId // .oasID // .id // empty' oas_upload.json)
 
-          JOBID=$(jq -r '.job_id // .id // empty' salt_upload_resp.json)
+          echo "oas_id=$OASID" >> $GITHUB_OUTPUT
 
-          echo "job_id=$JOBID" >> $GITHUB_OUTPUT
-          echo "Detected job id: $JOBID"
-
-
-      # ---------------------------
-      # 9. POLL UNTIL SALT JOB COMPLETES
-      # ---------------------------
-      - name: Poll Salt job
-        id: salt_poll
-        if: steps.salt_upload.outputs.job_id != ''
-        env:
-          SALT_API_URL: ${{ secrets.SALT_API_URL }}
-          SALT_API_TOKEN: ${{ secrets.SALT_API_TOKEN }}
+      # ------------------------------------------
+      # 5. Trigger Design Analysis
+      # POST /v1/oas/analyses/design?oasId=xxx
+      # ------------------------------------------
+      - name: Trigger Design Analysis
+        id: design_trigger
+        if: steps.oas_upload.outputs.oas_id != ''
         run: |
-          JOB=${{ steps.salt_upload.outputs.job_id }}
-          echo "Polling Salt job $JOB"
+          OASID="${{ steps.oas_upload.outputs.oas_id }}"
 
-          for i in $(seq 1 30); do
-            STATUS=$(curl -s \
-              -H "Authorization: Bearer $SALT_API_TOKEN" \
-              "$SALT_API_URL/api/v1/oas/jobs/$JOB/status" | jq -r '.status // .state // empty')
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            "$SALT_BASE/v1/oas/analyses/design?oasId=$OASID" \
+            -H "Authorization: Bearer $SALT_TOKEN" \
+            -H "accept: application/json")
 
-            echo "Attempt $i: status=$STATUS"
+          STATUS=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "$BODY" > design_trigger.json
 
-            if [[ "$STATUS" == "finished" || "$STATUS" == "completed" ]]; then
-              echo "Job completed. Downloading CSV..."
-              curl -s \
-                -H "Authorization: Bearer $SALT_API_TOKEN" \
-                "$SALT_API_URL/api/v1/oas/jobs/$JOB/export?format=csv" \
-                -o salt_oas_result.csv
-              break
-            fi
-            sleep 10
-          done
+          DID=$(jq -r '.analysisId // .id // empty' design_trigger.json)
 
+          echo "design_id=$DID" >> $GITHUB_OUTPUT
 
-      # ---------------------------
-      # 10. CHECK IF CSV EXISTS
-      # ---------------------------
-      - name: Check CSV existence
-        id: check_csv
+      # ------------------------------------------
+      # 6. Fetch Design Analysis Results
+      # GET /v1/oas/analyses/design/{analysisId}
+      # ------------------------------------------
+      - name: Fetch Design Results
+        if: steps.design_trigger.outputs.design_id != ''
         run: |
-          if [ -f salt_oas_result.csv ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
+          DID="${{ steps.design_trigger.outputs.design_id }}"
+
+          curl -s \
+            -H "Authorization: Bearer $SALT_TOKEN" \
+            "$SALT_BASE/v1/oas/analyses/design/$DID?limit=500&offset=0&reverse=false&statsOnly=false" \
+            > design_results.json
+
+          jq '.' design_results.json > design_results_pretty.json
+
+      # ------------------------------------------
+      # 7. Trigger Drift Analysis
+      # POST /v1/oas/analyses/drift?apiId=X&oasId=Y
+      # Needs apiId → try reading from upload JSON if present
+      # ------------------------------------------
+      - name: Trigger Drift Analysis
+        id: drift_trigger
+        if: steps.oas_upload.outputs.oas_id != ''
+        run: |
+          OASID="${{ steps.oas_upload.outputs.oas_id }}"
+
+          APIID=$(jq -r '.apiId // .apiID // .data.apiId // empty' oas_upload.json || true)
+
+          if [ -z "$APIID" ]; then
+            echo "drift_id=" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
+          RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            "$SALT_BASE/v1/oas/analyses/drift?apiId=$APIID&oasId=$OASID" \
+            -H "Authorization: Bearer $SALT_TOKEN")
 
-      # ---------------------------
-      # 11. COMMIT CSV BACK TO REPO
-      # ---------------------------
-      - name: Commit results to repo
-        if: success() && steps.check_csv.outputs.exists == 'true'
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "$BODY" > drift_trigger.json
+
+          DID=$(jq -r '.analysisId // .id // empty' drift_trigger.json)
+          echo "drift_id=$DID" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------
+      # 8. Fetch Drift Results
+      # GET /v1/oas/analyses/drift/{analysisId}
+      # ------------------------------------------
+      - name: Fetch Drift Results
+        if: steps.drift_trigger.outputs.drift_id != ''
+        run: |
+          DID="${{ steps.drift_trigger.outputs.drift_id }}"
+          APIID=$(jq -r '.apiId // .id // empty' oas_upload.json || true)
+
+          curl -s \
+            -H "Authorization: Bearer $SALT_TOKEN" \
+            "$SALT_BASE/v1/oas/analyses/drift/$DID?apiId=$APIID&statsOnly=false" \
+            > drift_results.json
+
+          jq '.' drift_results.json > drift_results_pretty.json
+
+      # ------------------------------------------
+      # 9. Save results and commit to branch
+      # ------------------------------------------
+      - name: Prepare Reports
+        run: |
+          mkdir -p reports
+          cp -f oas_upload.json reports/ 2>/dev/null || true
+          cp -f design_results_pretty.json reports/ 2>/dev/null || true
+          cp -f drift_results_pretty.json reports/ 2>/dev/null || true
+
+      - name: Commit Reports
         uses: stefanzweifel/git-auto-commit-action@v4
         with:
-          commit_message: "Salt OAS Analysis CSV for commit ${{ github.sha }}"
-          file_pattern: "salt_oas_result.csv"
+          commit_message: "Salt OAS Analysis results for ${{ github.sha }}"
+          file_pattern: "reports/*"
           branch: reports
           author_name: OAS-CI
           author_email: ci-bot@example.com
-
-
-      # ---------------------------
-      # 12. SEND EMAIL VIA OUTLOOK (OPTIONAL)
-      # ---------------------------
-      - name: Send CSV via Outlook
-        if: success() && steps.check_csv.outputs.exists == 'true'
-        env:
-          AZ_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZ_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          AZ_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-        run: |
-          echo "Sending email through Microsoft Graph API..."
-
-          TOKEN=$(curl -s -X POST \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "client_id=${AZ_CLIENT_ID}" \
-            -d "scope=https://graph.microsoft.com/.default" \
-            -d "client_secret=${AZ_CLIENT_SECRET}" \
-            -d "grant_type=client_credentials" \
-            "https://login.microsoftonline.com/${AZ_TENANT_ID}/oauth2/v2.0/token" | jq -r .access_token)
-
-          B64=$(base64 -w 0 salt_oas_result.csv)
-
-          cat > message.json <<EOF
-          {
-            "message": {
-              "subject": "Salt OAS Analysis Result - ${{ github.sha }}",
-              "body": { "contentType": "Text", "content": "Attached CSV from Salt OAS security analysis." },
-              "toRecipients": [
-                { "emailAddress": { "address": "security-team@example.com" } }
-              ],
-              "attachments": [
-                {
-                  "@odata.type": "#microsoft.graph.fileAttachment",
-                  "name": "salt_oas_result.csv",
-                  "contentBytes": "${B64}"
-                }
-              ]
-            }
-          }
-          EOF
-
-          curl -s -X POST \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -d @message.json \
-            "https://graph.microsoft.com/v1.0/users/you@example.com/sendMail"
-
