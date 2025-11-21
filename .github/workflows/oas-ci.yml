@@ -1,199 +1,109 @@
-name: OAS-CI
+name: Salt OAS CI
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: ["main"]
 
 env:
   BACKEND_DIR: Fast-Store-API/backend
-  SALT_BASE: https://api.secured-api.com/v1
-  NODE_VERSION: 18
 
 jobs:
-  oas-ci:
+  salt-oas:
     runs-on: ubuntu-latest
 
     steps:
-
-    # -----------------------------
-    # CHECKOUT CODE
-    # -----------------------------
-    - name: Checkout repository
+    - name: Checkout
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
-    # -----------------------------
-    # INSTALL NODE
-    # -----------------------------
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: ${{ env.NODE_VERSION }}
+        node-version: 18
 
-    # -----------------------------
-    # INSTALL BACKEND DEPENDENCIES
-    # -----------------------------
     - name: Install backend dependencies
       working-directory: ${{ env.BACKEND_DIR }}
-      run: npm ci
+      run: npm install
 
-    # -----------------------------
-    # INSTALL AUTOGEN TOOLS
-    # -----------------------------
-    - name: Install swagger-autogen + glob
-      run: npm install -g swagger-autogen glob
-
-    # -----------------------------
-    # GENERATE OAS FILE INSIDE backend/
-    # -----------------------------
-    - name: Generate OAS automatically
+    - name: Generate Swagger Autogen
       working-directory: ${{ env.BACKEND_DIR }}
       run: |
-        echo "Running autodetect OAS generator..."
-        node scripts/autodetect_generate_oas.js
+        npm install swagger-autogen glob --save-dev
 
-        echo "Generated files:"
-        ls -la .
+        cat > autodetect_generate_oas.js <<'EOF'
+        const glob = require("glob");
+        const swaggerAutogen = require("swagger-autogen")();
 
-        if [ ! -f openapi.generated.json ]; then
-          echo "❌ ERROR: OAS not generated"
+        const files = glob.sync("**/*.js", {
+          ignore: ["node_modules/**", "scripts/**"]
+        });
+
+        const entry = files.find(f => f.endsWith("index.js"));
+        const core = entry ? ["./" + entry] : [];
+
+        const outputFile = "./openapi.generated.json";
+
+        const doc = {
+          info: {
+            title: "Fast Store API",
+            description: "Auto-generated OAS"
+          }
+        };
+
+        swaggerAutogen(outputFile, core, doc);
+        EOF
+
+        node autodetect_generate_oas.js
+
+    - name: Verify OAS exists
+      run: |
+        FILE="${{ env.BACKEND_DIR }}/openapi.generated.json"
+        echo "Checking: $FILE"
+        if [ ! -f "$FILE" ]; then
+          echo "❌ OAS not found!"
           exit 1
         fi
+        ls -la "$FILE"
 
-        echo "OAS generated successfully ✔"
-
-    # -----------------------------
-    # UPLOAD OAS TO SALT
-    # -----------------------------
-    - name: Upload OAS to Salt
-      env:
-        SALT_TOKEN: ${{ secrets.SALT_TOKEN }}
+    - name: Base64 encode OAS
+      id: encode
       run: |
-        set -e
-        OAS_FILE="${BACKEND_DIR}/openapi.generated.json"
+        OAS="${{ env.BACKEND_DIR }}/openapi.generated.json"
+        B64=$(base64 -w 0 "$OAS")
+        echo "b64=$B64" >> $GITHUB_OUTPUT
 
-        echo "Checking file exists:"
-        ls -la "$OAS_FILE"
+    - name: Upload OAS to Salt
+      id: upload
+      env:
+        SALT_API_TOKEN: ${{ secrets.SALT_API_TOKEN }}
+        SALT_API_URL: ${{ secrets.SALT_API_URL }}
+      run: |
+        echo "Uploading OAS to Salt..."
 
-        echo "Uploading OAS: $OAS_FILE"
+        RESPONSE=$(curl -s -X POST "$SALT_API_URL/oas/files" \
+          -H "Authorization: Bearer $SALT_API_TOKEN" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "name=faststore-oas" \
+          --data-urlencode "file[]=${{ steps.encode.outputs.b64 }}" )
 
-        curl -v -X POST "$SALT_BASE/oas/files" \
-          -H "Authorization: Bearer $SALT_TOKEN" \
-          -H "accept: application/json" \
-          -F "name=faststore-oas" \
-          -F "file[]=@${OAS_FILE}" \
-          -o oas_upload.json
-
-        echo "Salt Upload Response:"
+        echo "$RESPONSE" > oas_upload.json
         cat oas_upload.json
 
         OAS_ID=$(jq -r '.oasId // empty' oas_upload.json)
+
         if [ -z "$OAS_ID" ]; then
-          echo "❌ ERROR: Could not parse oasId"
+          echo "❌ ERROR: Upload failed"
           exit 1
         fi
 
-        echo "✔ OAS ID: $OAS_ID"
         echo "oas_id=$OAS_ID" >> $GITHUB_OUTPUT
 
-    # -----------------------------
-    # TRIGGER DESIGN ANALYSIS
-    # -----------------------------
-    - name: Trigger Design Analysis
-      env:
-        SALT_TOKEN: ${{ secrets.SALT_TOKEN }}
-      run: |
-        ANALYSIS=$(curl -s -X POST "$SALT_BASE/oas/analyses/design?oasId=${{ steps.Upload_OAS_to_Salt.outputs.oas_id }}" \
-          -H "Authorization: Bearer $SALT_TOKEN" \
-          -H "accept: application/json")
-
-        echo "$ANALYSIS" > design_trigger.json
-        ANALYSIS_ID=$(jq -r '.analysisId // empty' design_trigger.json)
-
-        if [ -z "$ANALYSIS_ID" ]; then
-          echo "❌ ERROR: Could not parse design analysisId"
-          exit 1
-        fi
-
-        echo "design_id=$ANALYSIS_ID" >> $GITHUB_OUTPUT
-
-    # -----------------------------
-    # FETCH DESIGN ANALYSIS RESULTS
-    # -----------------------------
-    - name: Fetch Design Results
-      env:
-        SALT_TOKEN: ${{ secrets.SALT_TOKEN }}
-      run: |
-        curl -s "$SALT_BASE/oas/analyses/design/${{ steps.Trigger_Design_Analysis.outputs.design_id }}" \
-          -H "Authorization: Bearer $SALT_TOKEN" \
-          -H "accept: application/json" \
-          -o design_results.json
-
-        jq . design_results.json > design_results_pretty.json
-
-    # -----------------------------
-    # TRIGGER DRIFT ANALYSIS
-    # -----------------------------
-    - name: Trigger Drift Analysis
-      env:
-        SALT_TOKEN: ${{ secrets.SALT_TOKEN }}
-        # You MUST set API_ID correctly in repo secrets
-        API_ID: ${{ secrets.SALT_API_ID }}
-      run: |
-        DRIFT=$(curl -s -X POST "$SALT_BASE/oas/analyses/drift?apiId=$API_ID&oasId=${{ steps.Upload_OAS_to_Salt.outputs.oas_id }}" \
-          -H "Authorization: Bearer $SALT_TOKEN")
-
-        echo "$DRIFT" > drift_trigger.json
-        DRIFT_ID=$(jq -r '.analysisId // empty' drift_trigger.json)
-
-        if [ -z "$DRIFT_ID" ]; then
-          echo "❌ ERROR: Could not parse drift analysisId"
-          exit 1
-        fi
-
-        echo "drift_id=$DRIFT_ID" >> $GITHUB_OUTPUT
-
-    # -----------------------------
-    # FETCH DRIFT RESULTS
-    # -----------------------------
-    - name: Fetch Drift Results
-      env:
-        SALT_TOKEN: ${{ secrets.SALT_TOKEN }}
-        API_ID: ${{ secrets.SALT_API_ID }}
-      run: |
-        curl -s "$SALT_BASE/oas/analyses/drift/${{ steps.Trigger_Drift_Analysis.outputs.drift_id }}?apiId=$API_ID" \
-          -H "Authorization: Bearer $SALT_TOKEN" > drift_results.json
-
-        jq . drift_results.json > drift_results_pretty.json
-
-    # -----------------------------
-    # PREPARE REPORTS FOLDER
-    # -----------------------------
-    - name: Prepare Reports
-      run: |
-        mkdir -p reports
-        cp -f oas_upload.json reports/ || true
-        cp -f design_results_pretty.json reports/ || true
-        cp -f drift_results_pretty.json reports/ || true
-
-    # -----------------------------
-    # COMMIT OAS + REPORTS TO MAIN
-    # -----------------------------
-    - name: Commit OAS + Reports to main
+    - name: Commit generated OAS to main
       uses: stefanzweifel/git-auto-commit-action@v4
       with:
+        commit_message: "Add autogenerated OAS"
+        file_pattern: ${{ env.BACKEND_DIR }}/openapi.generated.json
         branch: main
-        commit_message: "Automated OAS + Salt Test Reports"
-        file_pattern: |
-          Fast-Store-API/backend/openapi.generated.json
-          reports/*
-      env:
-        GIT_AUTHOR_NAME: github-actions
-        GIT_AUTHOR_EMAIL: github-actions@github.com
-        GIT_COMMITTER_NAME: github-actions
-        GIT_COMMITTER_EMAIL: github-actions@github.com
-        REPO_PAT: ${{ secrets.REPO_PAT }}
-
+        commit_user_name: github-actions[bot]
+        commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
+        repository: .
+        token: ${{ secrets.REPO_PAT }}
